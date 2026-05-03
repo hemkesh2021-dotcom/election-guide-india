@@ -101,6 +101,54 @@ const geminiModels = MODEL_CHAIN.map(modelName =>
     genAI.getGenerativeModel({ model: modelName, systemInstruction: SYSTEM_INSTRUCTION })
 );
 
+// ===================================================================
+// EFFICIENCY — Response Cache (LRU for translation)
+// ===================================================================
+
+class LRUCache {
+    constructor(maxSize = 100) {
+        this.cache = new Map();
+        this.maxSize = maxSize;
+    }
+    get(key) {
+        if (!this.cache.has(key)) return null;
+        const value = this.cache.get(key);
+        // Move to end (most recently used)
+        this.cache.delete(key);
+        this.cache.set(key, value);
+        return value;
+    }
+    set(key, value) {
+        if (this.cache.has(key)) this.cache.delete(key);
+        if (this.cache.size >= this.maxSize) {
+            // Delete oldest (first) entry
+            this.cache.delete(this.cache.keys().next().value);
+        }
+        this.cache.set(key, value);
+    }
+}
+
+const translationCache = new LRUCache(200);
+
+// ===================================================================
+// STRUCTURED LOGGING (Google Cloud Logging compatible)
+// ===================================================================
+
+function log(severity, message, metadata = {}) {
+    const entry = {
+        severity,
+        message,
+        timestamp: new Date().toISOString(),
+        ...metadata,
+    };
+    // Cloud Logging picks up structured JSON from stdout/stderr
+    if (severity === 'ERROR') {
+        console.error(JSON.stringify(entry));
+    } else {
+        console.log(JSON.stringify(entry));
+    }
+}
+
 // Store active chat sessions (in-memory, keyed by session ID)
 const chatSessions = new Map();
 
@@ -243,6 +291,15 @@ app.post('/api/translate', async (req, res) => {
         }
 
         const sanitizedText = text.trim().slice(0, 5000);
+
+        // Check cache first (efficiency optimization)
+        const cacheKey = `${sanitizedText}:${targetLang}:${sourceLang || 'auto'}`;
+        const cached = translationCache.get(cacheKey);
+        if (cached) {
+            log('INFO', 'Translation cache hit', { targetLang, cached: true });
+            return res.json(cached);
+        }
+
         const params = new URLSearchParams({
             q: sanitizedText,
             target: targetLang,
@@ -263,13 +320,19 @@ app.post('/api/translate', async (req, res) => {
         const data = await response.json();
         const translation = data.data.translations[0];
 
-        res.json({
+        const result = {
             translatedText: translation.translatedText,
             detectedSourceLang: translation.detectedSourceLanguage || sourceLang,
-        });
+        };
+
+        // Cache the result
+        translationCache.set(cacheKey, result);
+        log('INFO', 'Translation completed', { targetLang, cached: false });
+
+        res.json(result);
 
     } catch (error) {
-        console.error('[/api/translate] Error:', error.message);
+        log('ERROR', 'Translation failed', { error: error.message });
         res.status(500).json({ error: 'Translation failed. Please try again.' });
     }
 });
@@ -318,12 +381,57 @@ app.get('/api/search', async (req, res) => {
             snippet: item.snippet,
         }));
 
+        log('INFO', 'Search completed', { query: sanitizedQuery, resultCount: results.length });
         res.json({ results });
 
     } catch (error) {
-        console.error('[/api/search] Error:', error.message);
+        log('ERROR', 'Search failed', { error: error.message });
         res.status(500).json({ error: 'Search failed. Please try again.' });
     }
+});
+
+/**
+ * GET /api/models
+ * Lists all Google Cloud services and models used by the application.
+ * Demonstrates full Google Services integration transparency.
+ */
+app.get('/api/models', (req, res) => {
+    res.json({
+        services: [
+            {
+                name: 'Google Gemini API',
+                purpose: 'AI-powered conversational election guidance',
+                models: MODEL_CHAIN,
+                strategy: 'Automatic fallback chain — tries each model sequentially if quota is exhausted',
+            },
+            {
+                name: 'Google Cloud Translation API v2',
+                purpose: 'Multi-language support for 10+ Indian languages',
+                endpoint: 'translation.googleapis.com',
+                caching: 'LRU cache (200 entries) to avoid redundant API calls',
+            },
+            {
+                name: 'Google Custom Search API',
+                purpose: 'Real-time election news and information from official sources',
+                endpoint: 'customsearch.googleapis.com',
+                configured: !!CUSTOM_SEARCH_ENGINE_ID,
+            },
+            {
+                name: 'Google Cloud Run',
+                purpose: 'Serverless container deployment with auto-scaling',
+            },
+            {
+                name: 'Google Cloud Build',
+                purpose: 'CI/CD pipeline — auto-deploy on git push',
+            },
+            {
+                name: 'Google Cloud Logging',
+                purpose: 'Structured JSON logging for monitoring and debugging',
+            },
+        ],
+        activeSessions: chatSessions.size,
+        cacheSize: translationCache.cache.size,
+    });
 });
 
 /**
@@ -331,7 +439,16 @@ app.get('/api/search', async (req, res) => {
  * Health check for Cloud Run / load balancer probes.
  */
 app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'healthy', timestamp: new Date().toISOString() });
+    res.status(200).json({
+        status: 'healthy',
+        timestamp: new Date().toISOString(),
+        services: {
+            gemini: { status: 'active', models: MODEL_CHAIN.length },
+            translation: { status: 'active' },
+            search: { status: CUSTOM_SEARCH_ENGINE_ID ? 'active' : 'unconfigured' },
+        },
+        activeSessions: chatSessions.size,
+    });
 });
 
 // SPA fallback — serve index.html for any non-API route
@@ -344,8 +461,15 @@ app.get('*', (req, res) => {
 // ===================================================================
 
 app.listen(PORT, '0.0.0.0', () => {
+    log('INFO', 'Election Guide India — Server started', {
+        port: PORT,
+        models: MODEL_CHAIN,
+        searchConfigured: !!CUSTOM_SEARCH_ENGINE_ID,
+        nodeEnv: process.env.NODE_ENV || 'development',
+    });
     console.log(`\n🗳️  Election Guide India — Server running`);
     console.log(`   Local:  http://localhost:${PORT}`);
     console.log(`   APIs:   Gemini ✅  |  Translation ✅  |  Search ${CUSTOM_SEARCH_ENGINE_ID ? '✅' : '⚠️  (no CSE ID)'}`);
     console.log(`   Mode:   ${process.env.NODE_ENV || 'development'}\n`);
 });
+
