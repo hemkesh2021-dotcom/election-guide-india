@@ -88,10 +88,18 @@ PERSONALIZATION:
 
 LANGUAGE: Respond in the same language the user writes in. Default to English.`;
 
-const geminiModel = genAI.getGenerativeModel({
-    model: 'gemini-2.0-flash',
-    systemInstruction: SYSTEM_INSTRUCTION,
-});
+/** Ordered fallback chain — each model has its own separate free-tier quota */
+const MODEL_CHAIN = [
+    'gemini-2.0-flash-lite',
+    'gemini-2.0-flash',
+    'gemini-2.5-flash-lite',
+    'gemini-2.5-flash',
+];
+
+/** Create model instances for the fallback chain */
+const geminiModels = MODEL_CHAIN.map(modelName =>
+    genAI.getGenerativeModel({ model: modelName, systemInstruction: SYSTEM_INSTRUCTION })
+);
 
 // Store active chat sessions (in-memory, keyed by session ID)
 const chatSessions = new Map();
@@ -150,9 +158,9 @@ app.use(express.static(join(__dirname, 'public')));
 
 /**
  * POST /api/chat
- * Smart conversation with Gemini.
+ * Smart conversation with Gemini (auto-fallback across models).
  * Body: { message: string, sessionId?: string }
- * Response: { reply: string, sessionId: string }
+ * Response: { reply: string, sessionId: string, model: string }
  */
 app.post('/api/chat', async (req, res) => {
     try {
@@ -165,32 +173,57 @@ app.post('/api/chat', async (req, res) => {
         // Truncate overly long messages
         const sanitizedMessage = message.trim().slice(0, 2000);
 
-        // Get or create chat session for multi-turn context
-        let sid = sessionId;
-        let chatSession;
+        // Try each model in the fallback chain
+        let lastError = null;
+        for (let i = 0; i < geminiModels.length; i++) {
+            const modelName = MODEL_CHAIN[i];
+            try {
+                // Get or create chat session for this model
+                const sessionKey = `${sessionId || 'new'}_${modelName}`;
+                let sid = sessionId;
+                let chatSession;
 
-        if (sid && chatSessions.has(sid)) {
-            chatSession = chatSessions.get(sid);
-            chatSession.lastActive = Date.now();
-        } else {
-            sid = crypto.randomUUID();
-            chatSession = {
-                chat: geminiModel.startChat(),
-                lastActive: Date.now(),
-            };
-            chatSessions.set(sid, chatSession);
+                if (sid && chatSessions.has(sid)) {
+                    chatSession = chatSessions.get(sid);
+                    chatSession.lastActive = Date.now();
+                } else {
+                    sid = crypto.randomUUID();
+                    chatSession = {
+                        chat: geminiModels[i].startChat(),
+                        modelIndex: i,
+                        lastActive: Date.now(),
+                    };
+                    chatSessions.set(sid, chatSession);
+                }
+
+                // If session was created with a different model, recreate chat
+                if (chatSession.modelIndex !== i) {
+                    chatSession.chat = geminiModels[i].startChat();
+                    chatSession.modelIndex = i;
+                }
+
+                const result = await chatSession.chat.sendMessage(sanitizedMessage);
+                const reply = result.response.text();
+
+                console.log(`[/api/chat] ✅ ${modelName} responded`);
+                return res.json({ reply, sessionId: sid, model: modelName });
+
+            } catch (modelError) {
+                lastError = modelError;
+                console.warn(`[/api/chat] ⚠️ ${modelName} failed: ${modelError.message?.slice(0, 100)}`);
+                // Continue to next model in chain
+            }
         }
 
-        const result = await chatSession.chat.sendMessage(sanitizedMessage);
-        const reply = result.response.text();
-
-        res.json({ reply, sessionId: sid });
+        // All models exhausted
+        console.error('[/api/chat] ❌ All models failed:', lastError?.message);
+        if (lastError?.message?.includes('SAFETY')) {
+            return res.status(400).json({ error: 'Your message could not be processed due to content safety filters. Please rephrase.' });
+        }
+        res.status(500).json({ error: 'Failed to generate a response. Please try again.' });
 
     } catch (error) {
         console.error('[/api/chat] Error:', error.message);
-        if (error.message?.includes('SAFETY')) {
-            return res.status(400).json({ error: 'Your message could not be processed due to content safety filters. Please rephrase.' });
-        }
         res.status(500).json({ error: 'Failed to generate a response. Please try again.' });
     }
 });
