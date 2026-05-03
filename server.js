@@ -22,6 +22,8 @@ import cors from 'cors';
 import helmet from 'helmet';
 import rateLimit from 'express-rate-limit';
 import { GoogleGenerativeAI } from '@google/generative-ai';
+import { v2 as translation } from '@google-cloud/translate';
+import { google } from 'googleapis';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
@@ -32,8 +34,11 @@ import { dirname, join } from 'path';
 /** @type {number} Server port — defaults to 8080 for Cloud Run */
 const PORT = parseInt(process.env.PORT, 10) || 8080;
 
-/** @type {string} Google API key for Gemini, Translation, and Search */
+/** @type {string} Google API key for Gemini */
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+
+/** @type {string} Google Cloud API key for Translation and Search */
+const GOOGLE_CLOUD_API_KEY = process.env.GOOGLE_CLOUD_API_KEY || GOOGLE_API_KEY;
 
 /** @type {string} Custom Search Engine ID for real-time search */
 const CUSTOM_SEARCH_ENGINE_ID = process.env.CUSTOM_SEARCH_ENGINE_ID || '';
@@ -66,6 +71,8 @@ const __dirname = dirname(__filename);
 // ===================================================================
 
 const genAI = new GoogleGenerativeAI(GOOGLE_API_KEY);
+const translateClient = new translation.Translate({ key: GOOGLE_CLOUD_API_KEY });
+const customsearch = google.customsearch('v1');
 
 /** System instruction that enforces neutrality and election-guide behavior */
 const SYSTEM_INSTRUCTION = `You are an AI Election Guide Assistant designed to help users understand the election process in India in a clear, neutral, and step-by-step manner.
@@ -377,29 +384,14 @@ app.post('/api/translate', async (req, res) => {
             return res.json(cached);
         }
 
-        const params = new URLSearchParams({
-            q: sanitizedText,
-            target: targetLang,
-            key: GOOGLE_API_KEY,
-            format: 'text',
+        const [translatedText, metadata] = await translateClient.translate(sanitizedText, {
+            to: targetLang,
+            from: sourceLang || undefined,
         });
-        if (sourceLang) params.append('source', sourceLang);
-
-        const response = await fetch(
-            `https://translation.googleapis.com/language/translate/v2?${params.toString()}`
-        );
-
-        if (!response.ok) {
-            const errData = await response.json();
-            throw new Error(errData.error?.message || 'Translation API request failed');
-        }
-
-        const data = await response.json();
-        const translation = data.data.translations[0];
 
         const result = {
-            translatedText: translation.translatedText,
-            detectedSourceLang: translation.detectedSourceLanguage || sourceLang,
+            translatedText: translatedText,
+            detectedSourceLang: metadata?.data?.translations[0]?.detectedSourceLanguage || sourceLang,
         };
 
         // Cache the result
@@ -435,24 +427,14 @@ app.get('/api/search', async (req, res) => {
         }
 
         const sanitizedQuery = query.trim().slice(0, MAX_SEARCH_QUERY_LENGTH);
-        const params = new URLSearchParams({
-            q: `${sanitizedQuery} India election`,
-            key: GOOGLE_API_KEY,
+        const response = await customsearch.cse.list({
             cx: CUSTOM_SEARCH_ENGINE_ID,
-            num: '5',
+            q: `${sanitizedQuery} India election`,
+            auth: GOOGLE_CLOUD_API_KEY,
+            num: 5,
         });
 
-        const response = await fetch(
-            `https://customsearch.googleapis.com/customsearch/v1?${params.toString()}`
-        );
-
-        if (!response.ok) {
-            const errData = await response.json();
-            throw new Error(errData.error?.message || 'Search API request failed');
-        }
-
-        const data = await response.json();
-        const results = (data.items || []).map(item => ({
+        const results = (response.data.items || []).map(item => ({
             title: item.title,
             link: item.link,
             snippet: item.snippet,
