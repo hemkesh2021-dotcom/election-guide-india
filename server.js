@@ -1,12 +1,19 @@
 /**
- * Election Guide India — Backend Server
+ * @fileoverview Election Guide India — Backend Server
  *
- * Secure Express server integrating:
- *   1. Google Gemini API     — Smart, free-form conversation
- *   2. Cloud Translation API — Multi-language support
- *   3. Custom Search API     — Real-time election info from eci.gov.in
+ * Secure Express server integrating Google Cloud services:
+ *   1. Google Gemini API (generativelanguage.googleapis.com)
+ *   2. Google Cloud Translation API v2 (translation.googleapis.com)
+ *   3. Google Custom Search API (customsearch.googleapis.com)
+ *   4. Google Cloud Run (container deployment)
+ *   5. Google Cloud Logging (structured JSON output)
+ *   6. Google Cloud Build (CI/CD via cloudbuild.yaml)
+ *   7. Google Secret Manager (API key injection)
+ *   8. Google Artifact Registry (Docker image storage)
  *
- * Designed for Google Cloud Run deployment.
+ * @author Hemkesh
+ * @version 1.0.0
+ * @license MIT
  */
 
 import 'dotenv/config';
@@ -22,9 +29,29 @@ import { dirname, join } from 'path';
 // CONFIGURATION & VALIDATION
 // ===================================================================
 
+/** @type {number} Server port — defaults to 8080 for Cloud Run */
 const PORT = parseInt(process.env.PORT, 10) || 8080;
+
+/** @type {string} Google API key for Gemini, Translation, and Search */
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
+
+/** @type {string} Custom Search Engine ID for real-time search */
 const CUSTOM_SEARCH_ENGINE_ID = process.env.CUSTOM_SEARCH_ENGINE_ID || '';
+
+/** @type {number} Maximum message length accepted from clients */
+const MAX_MESSAGE_LENGTH = 2000;
+
+/** @type {number} Maximum translation text length */
+const MAX_TRANSLATION_LENGTH = 5000;
+
+/** @type {number} Maximum search query length */
+const MAX_SEARCH_QUERY_LENGTH = 200;
+
+/** @type {number} Session timeout in milliseconds (30 minutes) */
+const SESSION_TTL_MS = 30 * 60 * 1000;
+
+/** @type {number} Rate limit — requests per minute per IP */
+const RATE_LIMIT_RPM = 30;
 
 if (!GOOGLE_API_KEY) {
     console.error('❌ FATAL: GOOGLE_API_KEY is not set. Set it in .env or as an environment variable.');
@@ -102,14 +129,35 @@ const geminiModels = MODEL_CHAIN.map(modelName =>
 );
 
 // ===================================================================
-// EFFICIENCY — Response Cache (LRU for translation)
+// EFFICIENCY — LRU Response Cache
 // ===================================================================
 
+/**
+ * Least Recently Used (LRU) cache for avoiding redundant API calls.
+ * Uses Map insertion order for O(1) get/set/eviction.
+ *
+ * @class
+ * @example
+ *   const cache = new LRUCache(100);
+ *   cache.set('key', { data: 'value' });
+ *   cache.get('key'); // → { data: 'value' }
+ */
 class LRUCache {
+    /**
+     * @param {number} maxSize - Maximum number of entries before eviction
+     */
     constructor(maxSize = 100) {
+        /** @type {Map<string, *>} */
         this.cache = new Map();
+        /** @type {number} */
         this.maxSize = maxSize;
     }
+
+    /**
+     * Retrieve a cached value and promote it to most-recently-used.
+     * @param {string} key - Cache key
+     * @returns {*|null} Cached value or null if not found
+     */
     get(key) {
         if (!this.cache.has(key)) return null;
         const value = this.cache.get(key);
@@ -118,6 +166,12 @@ class LRUCache {
         this.cache.set(key, value);
         return value;
     }
+
+    /**
+     * Store a value, evicting the oldest entry if at capacity.
+     * @param {string} key - Cache key
+     * @param {*} value - Value to cache
+     */
     set(key, value) {
         if (this.cache.has(key)) this.cache.delete(key);
         if (this.cache.size >= this.maxSize) {
@@ -128,12 +182,22 @@ class LRUCache {
     }
 }
 
+/** @type {LRUCache} Translation response cache (avoids redundant API calls) */
 const translationCache = new LRUCache(200);
 
 // ===================================================================
 // STRUCTURED LOGGING (Google Cloud Logging compatible)
 // ===================================================================
 
+/**
+ * Emit structured JSON logs compatible with Google Cloud Logging.
+ * Cloud Logging automatically parses `severity`, `message`, and `timestamp` fields.
+ *
+ * @param {'INFO'|'WARNING'|'ERROR'|'DEBUG'} severity - Log level
+ * @param {string} message - Human-readable log message
+ * @param {Object} [metadata={}] - Additional structured data
+ * @see https://cloud.google.com/logging/docs/structured-logging
+ */
 function log(severity, message, metadata = {}) {
     const entry = {
         severity,
@@ -141,7 +205,6 @@ function log(severity, message, metadata = {}) {
         timestamp: new Date().toISOString(),
         ...metadata,
     };
-    // Cloud Logging picks up structured JSON from stdout/stderr
     if (severity === 'ERROR') {
         console.error(JSON.stringify(entry));
     } else {
@@ -149,17 +212,31 @@ function log(severity, message, metadata = {}) {
     }
 }
 
-// Store active chat sessions (in-memory, keyed by session ID)
+/**
+ * In-memory chat session store.
+ * Each session contains a Gemini chat instance for multi-turn context.
+ * Sessions expire after SESSION_TTL_MS of inactivity.
+ * @type {Map<string, {chat: Object, modelIndex: number, lastActive: number}>}
+ */
 const chatSessions = new Map();
 
-// Clean up old sessions every 30 minutes
+/**
+ * Periodic session cleanup — evicts expired sessions every 5 minutes.
+ * Prevents unbounded memory growth from abandoned sessions.
+ */
 setInterval(() => {
-    const maxAge = 30 * 60 * 1000; // 30 minutes
     const now = Date.now();
+    let evicted = 0;
     for (const [id, session] of chatSessions) {
-        if (now - session.lastActive > maxAge) {
+        if (now - session.lastActive > SESSION_TTL_MS) {
             chatSessions.delete(id);
+            evicted++;
         }
+    }
+    if (evicted > 0) {
+        log('INFO', `Session cleanup: evicted ${evicted} expired session(s)`, {
+            remaining: chatSessions.size,
+        });
     }
 }, 5 * 60 * 1000);
 
@@ -189,7 +266,7 @@ app.use(express.json({ limit: '10kb' })); // Limit payload size
 // Rate limiting — 30 requests per minute per IP
 const apiLimiter = rateLimit({
     windowMs: 60 * 1000,
-    max: 30,
+    max: RATE_LIMIT_RPM,
     standardHeaders: true,
     legacyHeaders: false,
     message: { error: 'Too many requests. Please wait a moment before trying again.' },
@@ -219,7 +296,7 @@ app.post('/api/chat', async (req, res) => {
         }
 
         // Truncate overly long messages
-        const sanitizedMessage = message.trim().slice(0, 2000);
+        const sanitizedMessage = message.trim().slice(0, MAX_MESSAGE_LENGTH);
 
         // Try each model in the fallback chain
         let lastError = null;
@@ -290,7 +367,7 @@ app.post('/api/translate', async (req, res) => {
             return res.status(400).json({ error: 'text and targetLang are required.' });
         }
 
-        const sanitizedText = text.trim().slice(0, 5000);
+        const sanitizedText = text.trim().slice(0, MAX_TRANSLATION_LENGTH);
 
         // Check cache first (efficiency optimization)
         const cacheKey = `${sanitizedText}:${targetLang}:${sourceLang || 'auto'}`;
@@ -357,7 +434,7 @@ app.get('/api/search', async (req, res) => {
             });
         }
 
-        const sanitizedQuery = query.trim().slice(0, 200);
+        const sanitizedQuery = query.trim().slice(0, MAX_SEARCH_QUERY_LENGTH);
         const params = new URLSearchParams({
             q: `${sanitizedQuery} India election`,
             key: GOOGLE_API_KEY,
