@@ -26,20 +26,7 @@ document.addEventListener('DOMContentLoaded', () => {
     // SANITIZATION UTILITY
     // ===================================================================
 
-    function sanitizeHTML(html) {
-        const temp = document.createElement('div');
-        temp.innerHTML = html;
-        const dangerous = temp.querySelectorAll('script, iframe, object, embed, form, input, link, style');
-        dangerous.forEach(el => el.remove());
-        temp.querySelectorAll('*').forEach(el => {
-            for (const attr of [...el.attributes]) {
-                if (attr.name.startsWith('on') || (attr.name === 'href' && attr.value.startsWith('javascript:'))) {
-                    el.removeAttribute(attr.name);
-                }
-            }
-        });
-        return temp.innerHTML;
-    }
+    const sanitizeHTML = window.sanitizeHTML;
 
     // ===================================================================
     // BACKEND CLIENT — Calls the secure server APIs
@@ -445,6 +432,9 @@ document.addEventListener('DOMContentLoaded', () => {
                         responseHTML = translated.translatedText;
                     }
                 }
+                if (result.contextReset) {
+                    responseHTML = '<p>Previous conversation context expired or the server restarted. This reply uses only your latest message.</p>' + responseHTML;
+                }
             } else {
                 // Fallback to local knowledge base
                 const fallbackData = localEngine.match(text);
@@ -504,3 +494,4 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     })();
 });
+

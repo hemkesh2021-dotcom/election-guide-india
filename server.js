@@ -17,6 +17,8 @@
  */
 
 import 'dotenv/config';
+import { randomUUID } from 'node:crypto';
+import { respondWithFallback } from './chat-session.js';
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
@@ -282,6 +284,7 @@ const apiLimiter = rateLimit({
 app.use('/api/', apiLimiter);
 
 // Serve static frontend from /public
+app.get('/vendor/purify.min.js', (req, res) => res.sendFile(join(__dirname, 'node_modules/dompurify/dist/purify.min.js')));
 app.use(express.static(join(__dirname, 'public')));
 
 // ===================================================================
@@ -305,54 +308,31 @@ app.post('/api/chat', async (req, res) => {
         // Truncate overly long messages
         const sanitizedMessage = message.trim().slice(0, MAX_MESSAGE_LENGTH);
 
-        // Try each model in the fallback chain
-        let lastError = null;
-        for (let i = 0; i < geminiModels.length; i++) {
-            const modelName = MODEL_CHAIN[i];
-            try {
-                // Get or create chat session for this model
-                const sessionKey = `${sessionId || 'new'}_${modelName}`;
-                let sid = sessionId;
-                let chatSession;
-
-                if (sid && chatSessions.has(sid)) {
-                    chatSession = chatSessions.get(sid);
-                    chatSession.lastActive = Date.now();
-                } else {
-                    sid = crypto.randomUUID();
-                    chatSession = {
-                        chat: geminiModels[i].startChat(),
-                        modelIndex: i,
-                        lastActive: Date.now(),
-                    };
-                    chatSessions.set(sid, chatSession);
-                }
-
-                // If session was created with a different model, recreate chat
-                if (chatSession.modelIndex !== i) {
-                    chatSession.chat = geminiModels[i].startChat();
-                    chatSession.modelIndex = i;
-                }
-
-                const result = await chatSession.chat.sendMessage(sanitizedMessage);
-                const reply = result.response.text();
-
-                console.log(`[/api/chat] ✅ ${modelName} responded`);
-                return res.json({ reply, sessionId: sid, model: modelName });
-
-            } catch (modelError) {
-                lastError = modelError;
-                console.warn(`[/api/chat] ⚠️ ${modelName} failed: ${modelError.message?.slice(0, 100)}`);
-                // Continue to next model in chain
-            }
+        if (sessionId != null && (typeof sessionId !== 'string' || sessionId.length > 100)) {
+            return res.status(400).json({ error: 'Invalid session ID.' });
         }
-
-        // All models exhausted
-        console.error('[/api/chat] ❌ All models failed:', lastError?.message);
-        if (lastError?.message?.includes('SAFETY')) {
-            return res.status(400).json({ error: 'Your message could not be processed due to content safety filters. Please rephrase.' });
+        let sid = sessionId;
+        let session = chatSessions.get(sid);
+        if (session && Date.now() - session.lastActive > SESSION_TTL_MS) {
+            chatSessions.delete(sid);
+            session = null;
         }
-        res.status(500).json({ error: 'Failed to generate a response. Please try again.' });
+        const contextReset = Boolean(sessionId && !session);
+        if (!session) {
+            if (chatSessions.size >= 1000) return res.status(503).json({ error: 'Server busy. Try again later.' });
+            sid = randomUUID();
+            session = { history: [], modelIndex: 0, lastActive: Date.now(), busy: false };
+            chatSessions.set(sid, session);
+        }
+        if (session.busy) return res.status(409).json({ error: 'Please wait for the previous reply.' });
+        session.busy = true;
+        try {
+            const result = await respondWithFallback(geminiModels, session, sanitizedMessage);
+            session.lastActive = Date.now();
+            return res.json({ reply: result.reply, sessionId: sid, model: MODEL_CHAIN[result.modelIndex], contextReset });
+        } finally {
+            session.busy = false;
+        }
 
     } catch (error) {
         console.error('[/api/chat] Error:', error.message);
@@ -531,4 +511,5 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`   APIs:   Gemini ✅  |  Translation ✅  |  Search ${CUSTOM_SEARCH_ENGINE_ID ? '✅' : '⚠️  (no CSE ID)'}`);
     console.log(`   Mode:   ${process.env.NODE_ENV || 'development'}\n`);
 });
+
 

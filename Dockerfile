@@ -6,8 +6,8 @@
 # Stage 1: Install dependencies
 FROM node:22-alpine AS deps
 WORKDIR /app
-COPY package.json ./
-RUN npm install --omit=dev --no-audit --no-fund && \
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev --no-audit --no-fund && \
     npm cache clean --force
 
 # Stage 2: Production image
@@ -22,7 +22,7 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 
 # Copy application code
-COPY package.json server.js ./
+COPY package.json server.js chat-session.js ./
 COPY public/ ./public/
 
 # Set ownership to non-root user
@@ -41,3 +41,4 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
 
 CMD ["node", "server.js"]
+

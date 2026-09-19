@@ -5,7 +5,7 @@
 ![Node.js](https://img.shields.io/badge/Node.js-20+-339933?logo=nodedotjs&logoColor=white)
 ![Google Cloud](https://img.shields.io/badge/Google_Cloud-Run-4285F4?logo=googlecloud&logoColor=white)
 ![Gemini](https://img.shields.io/badge/Gemini-2.0_Flash-8E75B2?logo=googlegemini&logoColor=white)
-![Tests](https://img.shields.io/badge/Tests-62_passing-brightgreen)
+
 ![License](https://img.shields.io/badge/License-MIT-blue)
 
 ---
@@ -26,7 +26,7 @@ India has **970M+ eligible voters**, many of whom — especially first-time vote
 | ⚖️ **Strict Neutrality** | AI is constrained to never recommend parties or candidates |
 | 📱 **Responsive UI** | Glassmorphic dark theme, accessible on all devices |
 | 🛡️ **Production Security** | Helmet, rate limiting, XSS sanitization, CSP headers |
-| 🧪 **62 Automated Tests** | Unit, integration, and security test suites |
+| 🧪 **Automated Tests** | Unit, integration, and security test suites |
 | 🐳 **Containerized** | Multi-stage Dockerfile, Cloud Run ready |
 
 ## 🏗️ Architecture
@@ -194,3 +194,10 @@ election-guide-india/
 ## 📄 License
 
 MIT — Built for [Google PromptWars](https://promptwars.google) challenge.
+
+
+## Reproducible builds and session limits
+
+Use Node.js 22.12+ and `npm ci`, then `npm run test:unit`. Tests exercise the actual browser sanitizer and provider-independent conversation fallback with mocked models; they do not spend API credits. API integration tests require a separately running server.
+
+The deployment is capped at one instance while sessions are in memory. History survives model fallback, but not a restart or revision change; an unknown or expired session returns `contextReset: true`. Store sessions in a shared database before enabling multiple instances. Histories retain the latest ten exchanges, sessions expire after 30 minutes, and concurrent messages within a session are rejected rather than racing. Do not treat these anonymous sessions as authenticated accounts.

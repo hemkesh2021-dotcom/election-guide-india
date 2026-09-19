@@ -17,15 +17,15 @@
 
 steps:
   # Step 1 — Install dependencies
-  - name: 'node:20-alpine'
+  - name: 'node:22-alpine'
     entrypoint: 'npm'
-    args: ['ci', '--production=false']
+    args: ['ci', '--include=dev']
     id: 'install'
 
   # Step 2 — Run unit tests (no server required)
-  - name: 'node:20-alpine'
+  - name: 'node:22-alpine'
     entrypoint: 'npx'
-    args: ['vitest', 'run', 'tests/matching.test.js', 'tests/security.test.js']
+    args: ['vitest', 'run', '--exclude', 'tests/api.test.js']
     id: 'unit-tests'
     waitFor: ['install']
 
@@ -65,7 +65,7 @@ steps:
       - '--memory=256Mi'
       - '--cpu=1'
       - '--min-instances=0'
-      - '--max-instances=5'
+      - '--max-instances=1'
       - '--set-secrets=GOOGLE_API_KEY=gemini-api-key:latest'
     id: 'deploy'
     waitFor: ['push']
@@ -88,3 +88,4 @@ options:
 
 # Build timeout
 timeout: '600s'
+
