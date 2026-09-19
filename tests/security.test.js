@@ -5,22 +5,13 @@
 
 import { describe, it, expect } from 'vitest';
 
-/**
- * Replicate the sanitizeHTML function from app.js using regex.
- * In production, the browser DOM handles this; for tests we use regex equivalents.
- */
-function sanitizeHTML(html) {
-    if (!html) return '';
-    // Remove dangerous tags
-    let clean = html.replace(/<(script|iframe|object|embed|form|input|link|style)[^>]*>[\s\S]*?<\/\1>/gi, '');
-    clean = clean.replace(/<(script|iframe|object|embed|form|input|link|style)[^>]*\/?>/gi, '');
-    // Remove event handlers
-    clean = clean.replace(/\s+on\w+\s*=\s*["'][^"']*["']/gi, '');
-    clean = clean.replace(/\s+on\w+\s*=\s*\S+/gi, '');
-    // Remove javascript: URLs
-    clean = clean.replace(/href\s*=\s*["']javascript:[^"']*["']/gi, 'href=""');
-    return clean;
-}
+import { JSDOM } from 'jsdom';
+import createDOMPurify from 'dompurify';
+import { readFileSync } from 'node:fs';
+const window = new JSDOM('', { runScripts: 'outside-only' }).window;
+window.DOMPurify = createDOMPurify(window);
+window.eval(readFileSync(new URL('../public/sanitize.js', import.meta.url), 'utf8'));
+const sanitizeHTML = window.sanitizeHTML;
 
 describe('XSS Prevention — sanitizeHTML', () => {
     it('should strip <script> tags', () => {
@@ -162,5 +153,20 @@ describe('API Key Security', () => {
         const content = readFileSync(join(__dirname, '..', '.env.example'), 'utf-8');
         expect(content).not.toMatch(/AIzaSy/);
         expect(content).toContain('your-google-api-key');
+    });
+});
+
+
+describe('Production sanitizer regressions', () => {
+    it('rejects mixed-case and entity-encoded executable URLs', () => {
+        for (const href of ['JaVaScRiPt:alert(1)', 'java&#x09;script:alert(1)', 'data:text/html,test']) {
+            const clean = sanitizeHTML(`<a href="${href}">link</a>`);
+            expect(clean).not.toContain('href=');
+        }
+    });
+    it('strips SVG and keeps an official HTTPS link', () => {
+        const clean = sanitizeHTML('<svg><a xlink:href="javascript:alert(1)">bad</a></svg><a href="https://eci.gov.in">ECI</a>');
+        expect(clean).not.toContain('<svg');
+        expect(clean).toContain('href="https://eci.gov.in"');
     });
 });
